@@ -36,20 +36,23 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
-# CORS Config - Must be added immediately after FastAPI initialization
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
-ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS]
-# Add production origin if not already present
-if 'https://www.edrastore.net' not in ALLOWED_ORIGINS:
-    ALLOWED_ORIGINS.append('https://www.edrastore.net')
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
+# CORS Config is handled by Nginx reverse proxy in production
+# For local development, uncomment the section below:
+# ALLOWED_ORIGINS = [
+#     'http://localhost:3000',
+#     'http://localhost:5000',
+#     'http://localhost',
+#     'http://127.0.0.1:3000',
+#     'http://127.0.0.1:5000',
+# ]
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=ALLOWED_ORIGINS,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+#     expose_headers=["*"],
+# )
 
 # ========== MODELS ==========
 
