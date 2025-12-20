@@ -770,20 +770,6 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://edrastore.net",
-        "http://edrastore.net",
-        "https://www.edrastore.net",
-        "http://www.edrastore.net",
-        "http://localhost",
-        "http://localhost:3000",
-        "http://127.0.0.1",
-        "http://127.0.0.1:3000",
-        "https://localhost",
-        "https://localhost:3000",
-    ],
-    # Allow any subdomain and both http/https for edrastore.net (includes ports)
-    # Also allow localhost and 127.0.0.1 with optional ports
     allow_origin_regex=r"^https?://([a-z0-9-]+\.)*edrastore\.net(:\d+)?$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
