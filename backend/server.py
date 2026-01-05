@@ -284,6 +284,9 @@ class CouponResponse(BaseModel):
     used_at: Optional[datetime] = None
     created_at: datetime
 
+class CouponWhatsAppRequest(BaseModel):
+    worker_phone: str  # Teléfono del trabajador (ej: 525252425434)
+
 # ========== AUTH HELPERS ==========
 
 def hash_password(password: str) -> str:
@@ -1044,11 +1047,12 @@ async def use_coupon(coupon_code: str, current_user: dict = Depends(get_current_
 @api_router.post("/coupons/{coupon_code}/generate-whatsapp-token")
 async def generate_whatsapp_token(
     coupon_code: str,
-    worker_phone: str,
+    request: CouponWhatsAppRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """Generate a WhatsApp token to mark coupon as used and send via WhatsApp"""
     try:
+        worker_phone = request.worker_phone
         coupon = await db.coupons.find_one({"code": coupon_code}, {"_id": 0})
         
         if not coupon:
