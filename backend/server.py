@@ -18,6 +18,9 @@ import bcrypt
 import jwt
 import requests
 import shutil
+import random
+import string
+import urllib.parse
 
 # Set Starlette max request size to 100MB BEFORE any other imports
 os.environ["STARLETTE_MAX_REQUEST_SIZE"] = str(100 * 1024 * 1024)
@@ -257,7 +260,6 @@ class Coupon(BaseModel):
     is_used: bool = False  # Si ha sido usado
     used_at: Optional[datetime] = None  # Cuándo se usó
     viewed_by_user: bool = False  # Si el usuario ha visto el cupón
-    status: str = "active"  # "active", "used", "expired", "cancelled"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str  # ID del admin que lo creó
 
@@ -806,36 +808,6 @@ async def get_user_watchlist(user_id: str, current_user: dict = Depends(get_admi
     
     return content_with_details
 
-@api_router.get("/admin/users/{user_id}/coupons")
-async def get_user_coupons_admin(user_id: str, current_user: dict = Depends(get_admin_user)):
-    """Get coupons of a specific user (admin only)"""
-    try:
-        # Verify user exists
-        user = await db.users.find_one({"id": user_id}, {"_id": 0})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Get user coupons
-        coupons = await db.coupons.find(
-            {"user_id": user_id},
-            {"_id": 0}
-        ).to_list(1000)
-        
-        # Convertir strings a datetime si es necesario
-        for coupon in coupons:
-            if isinstance(coupon['created_at'], str):
-                coupon['created_at'] = datetime.fromisoformat(coupon['created_at'])
-            if isinstance(coupon['expiry_date'], str):
-                coupon['expiry_date'] = datetime.fromisoformat(coupon['expiry_date'])
-            if coupon.get('used_at') and isinstance(coupon['used_at'], str):
-                coupon['used_at'] = datetime.fromisoformat(coupon['used_at'])
-        
-        return coupons
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @api_router.patch("/admin/users/{user_id}/reset-password")
 async def admin_reset_password(user_id: str, body: AdminPasswordReset, current_user: dict = Depends(get_admin_user)):
     """Reset a user's password (admin only)"""
@@ -997,52 +969,6 @@ async def delete_coupon(coupon_id: str, current_user: dict = Depends(get_admin_u
         raise HTTPException(status_code=404, detail="Coupon not found")
     return {"message": "Coupon deleted successfully"}
 
-@api_router.put("/admin/coupons/{coupon_id}/status")
-async def update_coupon_status(
-    coupon_id: str,
-    new_status: str,
-    current_user: dict = Depends(get_admin_user)
-):
-    """Update coupon status (admin only)"""
-    try:
-        # Validar estado válido
-        valid_statuses = ["active", "used", "expired", "cancelled"]
-        if new_status not in valid_statuses:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid status. Must be one of {valid_statuses}"
-            )
-        
-        # Verificar que el cupón existe
-        coupon = await db.coupons.find_one({"id": coupon_id}, {"_id": 0})
-        if not coupon:
-            raise HTTPException(status_code=404, detail="Coupon not found")
-        
-        # Actualizar estado
-        update_data = {"status": new_status}
-        
-        # Si se marca como usado, registrar la fecha
-        if new_status == "used":
-            update_data["is_used"] = True
-            update_data["used_at"] = datetime.now(timezone.utc).isoformat()
-        
-        result = await db.coupons.update_one(
-            {"id": coupon_id},
-            {"$set": update_data}
-        )
-        
-        if result.modified_count == 0:
-            raise HTTPException(status_code=400, detail="Could not update coupon")
-        
-        # Retornar cupón actualizado
-        updated_coupon = await db.coupons.find_one({"id": coupon_id}, {"_id": 0})
-        return updated_coupon
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @api_router.get("/user/coupons")
 async def get_user_coupons(current_user: dict = Depends(get_current_user)):
     """Get coupons for current user"""
@@ -1113,9 +1039,15 @@ async def use_coupon(coupon_code: str, current_user: dict = Depends(get_current_
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.post("/coupons/{coupon_code}/generate-token")
-async def generate_coupon_token(coupon_code: str, current_user: dict = Depends(get_current_user)):
-    """Generate a shareable token to use a coupon without authentication"""
+# ========== COUPON WHATSAPP ROUTES ==========
+
+@api_router.post("/coupons/{coupon_code}/generate-whatsapp-token")
+async def generate_whatsapp_token(
+    coupon_code: str,
+    worker_phone: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a WhatsApp token to mark coupon as used and send via WhatsApp"""
     try:
         coupon = await db.coupons.find_one({"code": coupon_code}, {"_id": 0})
         
@@ -1126,22 +1058,41 @@ async def generate_coupon_token(coupon_code: str, current_user: dict = Depends(g
         if coupon['user_id'] != current_user['user_id']:
             raise HTTPException(status_code=403, detail="This coupon is not for you")
         
-        # Generar token especial de una sola vez
-        token_payload = {
-            'coupon_code': coupon_code,
-            'user_id': current_user['user_id'],
-            'exp': datetime.now(timezone.utc) + timedelta(hours=24)
-        }
-        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        # Verificar que no esté usado
+        if coupon['is_used']:
+            raise HTTPException(status_code=400, detail="Coupon already used")
         
-        # Generar el URL
-        frontend_url = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-        shareable_url = f"{frontend_url}/coupon/use/{token}"
+        # Verificar fecha de vencimiento
+        expiry = datetime.fromisoformat(coupon['expiry_date']) if isinstance(coupon['expiry_date'], str) else coupon['expiry_date']
+        if datetime.now(timezone.utc) > expiry:
+            raise HTTPException(status_code=400, detail="Coupon expired")
+        
+        # Generar token único
+        use_token = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+        
+        # Guardar token en la base de datos
+        await db.coupon_use_tokens.insert_one({
+            "token": use_token,
+            "coupon_code": coupon_code,
+            "user_id": current_user['user_id'],
+            "worker_phone": worker_phone,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "used": False
+        })
+        
+        # URL para marcar como usado
+        use_url = f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/coupon/use/{use_token}"
+        
+        # Mensaje WhatsApp
+        whatsapp_message = f"Hola, te comparte este cupón para usar en tu compra:\n\nCupón: {coupon_code}\n{coupon['description']}\n\nHaz clic aquí para validar: {use_url}"
+        
+        # URL para abrir WhatsApp
+        whatsapp_url = f"https://wa.me/{worker_phone}?text={urllib.parse.quote(whatsapp_message)}"
         
         return {
-            "token": token,
-            "url": shareable_url,
-            "coupon_code": coupon_code
+            "token": use_token,
+            "whatsapp_url": whatsapp_url,
+            "message": "WhatsApp token generated successfully"
         }
     
     except HTTPException:
@@ -1149,32 +1100,26 @@ async def generate_coupon_token(coupon_code: str, current_user: dict = Depends(g
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/coupons/use/{token}")
-async def use_coupon_with_token(token: str):
-    """Use a coupon with a shareable token (no authentication required)"""
+@api_router.get("/coupons/use/{use_token}")
+async def use_coupon_with_token(use_token: str):
+    """Use a coupon with a WhatsApp token (no auth required)"""
     try:
-        # Validar token
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        except jwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token has expired")
-        except jwt.InvalidTokenError:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        # Buscar el token
+        token_doc = await db.coupon_use_tokens.find_one({"token": use_token}, {"_id": 0})
         
-        coupon_code = payload.get('coupon_code')
-        user_id = payload.get('user_id')
+        if not token_doc:
+            raise HTTPException(status_code=404, detail="Token not found or invalid")
         
-        if not coupon_code or not user_id:
-            raise HTTPException(status_code=400, detail="Invalid token")
+        if token_doc['used']:
+            raise HTTPException(status_code=400, detail="Coupon already marked as used")
         
+        coupon_code = token_doc['coupon_code']
+        
+        # Buscar y actualizar el cupón
         coupon = await db.coupons.find_one({"code": coupon_code}, {"_id": 0})
         
         if not coupon:
             raise HTTPException(status_code=404, detail="Coupon not found")
-        
-        # Verificar que pertenece al usuario del token
-        if coupon['user_id'] != user_id:
-            raise HTTPException(status_code=403, detail="This coupon is not for this token")
         
         # Verificar que no esté usado
         if coupon['is_used']:
@@ -1191,10 +1136,15 @@ async def use_coupon_with_token(token: str):
             {
                 "$set": {
                     "is_used": True,
-                    "used_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "used"
+                    "used_at": datetime.now(timezone.utc).isoformat()
                 }
             }
+        )
+        
+        # Marcar token como usado
+        await db.coupon_use_tokens.update_one(
+            {"token": use_token},
+            {"$set": {"used": True, "used_at": datetime.now(timezone.utc).isoformat()}}
         )
         
         if result.modified_count == 0:
