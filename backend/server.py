@@ -78,6 +78,17 @@ api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
 # ============================================================================
+# WEBSOCKET CACHE INVALIDATION - Importar router
+# ============================================================================
+try:
+    from routes.ws_cache import router as ws_router
+    logger = logging.getLogger(__name__)
+    logger.info("WebSocket cache invalidation router loaded")
+except ImportError as e:
+    logger = logging.getLogger(__name__)
+    logger.warning(f"Could not load WebSocket router: {e}")
+
+# ============================================================================
 # OPTIMIZACIÓN: Sistema de Caché para TMDB (reduce llamadas redundantes)
 # ============================================================================
 class TMDBCache:
@@ -111,6 +122,28 @@ class TMDBCache:
             del self.cache[key]
 
 tmdb_cache = TMDBCache()
+
+# ============================================================================
+# SISTEMA DE VERSIONADO DE CACHÉ PARA CLIENTES (invalidación de caché global)
+# ============================================================================
+class CacheVersionManager:
+    """Gestiona versiones de caché para que los clientes detecten cambios"""
+    def __init__(self):
+        self.versions = {
+            'content': 1,  # Versión del caché de contenido
+            'promotions': 1,  # Versión del caché de promociones
+        }
+    
+    def get_version(self, cache_type: str) -> int:
+        """Obtener la versión actual de un tipo de caché"""
+        return self.versions.get(cache_type, 1)
+    
+    def increment_version(self, cache_type: str):
+        """Incrementar la versión (cuando hay cambios)"""
+        if cache_type in self.versions:
+            self.versions[cache_type] += 1
+
+cache_version_manager = CacheVersionManager()
 
 # Mount static files for uploaded images
 app.mount("/uploads", StaticFiles(directory=str(ROOT_DIR / "uploads")), name="uploads")
@@ -703,6 +736,9 @@ async def add_content(content_data: ContentCreate, current_user: dict = Depends(
     doc['created_at'] = doc['created_at'].isoformat()
     await db.content.insert_one(doc)
     
+    # ✅ INVALIDAR CACHÉ PARA TODOS LOS CLIENTES
+    cache_version_manager.increment_version('content')
+    
     return content
 
 @api_router.get("/content")
@@ -744,21 +780,14 @@ async def get_all_content(page: int = 1, limit: int = 50):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
-        # Si no tiene trailer_url, intentar obtenerlo
-        if not item.get('trailer_url'):
-            trailer_key = get_trailer_url(item['tmdb_id'], item['content_type'])
-            if trailer_key:
-                trailer_url = f"https://www.youtube.com/embed/{trailer_key}"
-                item['trailer_key'] = trailer_key
-                item['trailer_url'] = trailer_url
-                # Actualizar la BD para no tener que hacerlo cada vez
-                await db.content.update_one(
-                    {"id": item['id']},
-                    {"$set": {"trailer_key": trailer_key, "trailer_url": trailer_url}}
-                )
-    
-    return content_list
+
+@api_router.get("/content/cache-version")
+async def get_cache_version():
+    """Obtener la versión actual del caché de contenido (para que los clientes sepan si deben limpiar su caché)"""
+    return {
+        "content_version": cache_version_manager.get_version('content'),
+        "promotions_version": cache_version_manager.get_version('promotions')
+    }
 
 @api_router.get("/content/{content_id}", response_model=Content)
 async def get_content_by_id(content_id: str):
@@ -874,6 +903,10 @@ async def delete_content(content_id: str, current_user: dict = Depends(get_admin
         raise HTTPException(status_code=404, detail="Content not found")
     # Also delete associated reviews
     await db.reviews.delete_many({"content_id": content_id})
+    
+    # ✅ INVALIDAR CACHÉ PARA TODOS LOS CLIENTES
+    cache_version_manager.increment_version('content')
+    
     return {"message": "Content deleted successfully"}
 
 # ========== REVIEW ROUTES ==========
@@ -1278,11 +1311,9 @@ async def create_coupon(
         
         # Si es aleatorio, seleccionar usuario aleatorio (excluyendo admins)
         if coupon_data.is_random:
-            users = await db.users.find({"role": "user"}, {"_id": 0, "id": 1}).to_list(None)
+            users = await db.users.find({"role": {"$ne": "admin"}}, {"_id": 0, "id": 1}).to_list(None)
             if not users:
                 raise HTTPException(status_code=400, detail="No regular users available")
-            target_user_id = users[len(users) // 2]["id"]  # Seleccionar usuario aleatorio
-            import random
             target_user_id = random.choice(users)["id"]
         
         if not target_user_id:
@@ -1296,8 +1327,6 @@ async def create_coupon(
             raise HTTPException(status_code=400, detail="Cannot create coupons for admins")
         
         # Generar código único
-        import random
-        import string
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
         
         # Verificar que el código sea único
@@ -1903,6 +1932,9 @@ async def update_all_content(current_user: dict = Depends(get_admin_user)):
             })
             failed_count += 1
     
+    # ✅ INVALIDAR CACHÉ PARA TODOS LOS CLIENTES
+    cache_version_manager.increment_version('content')
+    
     return {
         "message": "Content update completed",
         "total": len(all_content),
@@ -1961,6 +1993,9 @@ async def update_single_content(content_id: str, current_user: dict = Depends(ge
         
         if result.modified_count == 0:
             raise HTTPException(status_code=400, detail="Failed to update content")
+        
+        # ✅ INVALIDAR CACHÉ PARA TODOS LOS CLIENTES
+        cache_version_manager.increment_version('content')
         
         return {
             "message": "Content updated successfully",
