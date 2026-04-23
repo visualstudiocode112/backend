@@ -1,0 +1,11 @@
+{
+  "name": "Laushop Backend",
+  "version": "1.0.0",
+  "description": "Laushop Backend Server",
+  "main": "server.py",
+  "scripts": {
+    "start": "uvicorn server:app",
+    "dev": "uvicorn server:app --reload --log-level debug",
+    "start:prod": "uvicorn server:app --host 0.0.0.0 --port 8000"
+  }
+}
